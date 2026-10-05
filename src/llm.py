@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import importlib
 import os
+import re
 import time
 from dataclasses import dataclass, fields
 from typing import Any
@@ -23,7 +24,7 @@ PROVIDERS = {
     "openrouter": {"key": "OPENROUTER_API_KEY", "base_url": "https://openrouter.ai/api/v1",
                    "chat": "openai/gpt-4o-mini", "embed": "openai/text-embedding-3-small"},
     "gemini": {"key": "GEMINI_API_KEY", "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
-               "chat": "gemini-2.5-flash-lite", "embed": "gemini-embedding-001"},
+               "chat": "gemini-3.5-flash-lite", "embed": "gemini-embedding-001"},
     "anthropic": {"key": "ANTHROPIC_API_KEY", "base_url": None,
                   "chat": "claude-opus-5-5", "embed": None},
 }
@@ -37,6 +38,7 @@ PRICES_PER_M = {
     "text-embedding-3-small": (0.02, 0.0),
     "text-embedding-3-large": (0.13, 0.0),
     "gemini-2.5-flash-lite": (0.10, 0.40),
+    "gemini-3.5-flash-lite": (0.30, 2.50),
     # Gemini embedding pricing intentionally omitted: the current pricing page does not list gemini-embedding-001.
     "claude-opus-5-5": (4.00, 20.00),
     "claude-sonnet-5-5": (2.00, 10.00),
@@ -60,6 +62,23 @@ class Usage:
 def price(model: str, input_tokens: int, output_tokens: int = 0) -> float:
     per_in, per_out = PRICES_PER_M.get(model.split("/")[-1], (0.0, 0.0))   # "openai/gpt-4o-mini" -> "gpt-4o-mini"
     return (input_tokens * per_in + output_tokens * per_out) / 1_000_000
+
+
+def _retry_rate_limit(call):
+    """Respect a provider's explicit retry delay for temporary per-minute quotas."""
+    from openai import RateLimitError
+
+    for attempt in range(5):
+        try:
+            return call()
+        except RateLimitError as exc:
+            message = str(exc)
+            delay = re.search(r"retryDelay['\"]?\s*:\s*['\"](\d+)s", message)
+            if delay is None:
+                delay = re.search(r"retry in\s+([\d.]+)s", message, re.IGNORECASE)
+            if attempt == 4 or delay is None:
+                raise
+            time.sleep(min(float(delay.group(1)) + 2, 90))
 
 def pick_provider(env_var: str, need_embeddings: bool) -> str:
     """Explicit env choice, else the first provider (in PROVIDER_ORDER) whose API key is set."""
@@ -120,18 +139,18 @@ class MeteredLLM:
             text, model, tokens_in, tokens_out = self._chat_anthropic(prompt)
         else:
             if json_mode and self.chat_provider != "gemini":
-                response = self._chat_client.chat.completions.create(
+                response = _retry_rate_limit(lambda: self._chat_client.chat.completions.create(
                     model=self.chat_model_id,
                     messages=[{"role": "user", "content": prompt}],
                     temperature=0,
                     response_format={"type": "json_object"},
-                )
+                ))
             else:
-                response = self._chat_client.chat.completions.create(
+                response = _retry_rate_limit(lambda: self._chat_client.chat.completions.create(
                     model=self.chat_model_id,
                     messages=[{"role": "user", "content": prompt}],
                     temperature=0,
-                )
+                ))
             text, model = response.choices[0].message.content or "", self.chat_model_id
             usage = response.usage
             tokens_in = usage.prompt_tokens if usage else 0
@@ -158,7 +177,7 @@ class MeteredLLM:
 
     def embed(self, text: str) -> list[float]:
         start = time.perf_counter()
-        response = self._embed_client.embeddings.create(model=self.embed_model_id, input=text)
+        response = _retry_rate_limit(lambda: self._embed_client.embeddings.create(model=self.embed_model_id, input=text))
         tokens = getattr(response.usage, "prompt_tokens", 0) or 0   # some OpenAI-compatible APIs omit usage
         self.usage += Usage(1, tokens, 0, price(self.embed_model_id, tokens), time.perf_counter() - start)
         return [float(value) for value in response.data[0].embedding]
